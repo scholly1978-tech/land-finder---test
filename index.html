@@ -2404,7 +2404,29 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 (function(){
 'use strict';
 const $=id=>document.getElementById(id);
-let pdfJsPromise;
+let pdfJsPromise, ocrPromise;
+async function ensureOcr(){
+ if(window.Tesseract)return window.Tesseract;
+ if(!ocrPromise)ocrPromise=new Promise((resolve,reject)=>{const sc=document.createElement("script");sc.src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";sc.onload=()=>window.Tesseract?resolve(window.Tesseract):reject(Error("Image reader unavailable"));sc.onerror=()=>reject(Error("Could not load image reader. Check internet connection."));document.head.appendChild(sc);});
+ return ocrPromise;
+}
+async function ocrImage(source,onProgress){
+ const T=await ensureOcr();const worker=await T.createWorker("eng",1,{logger:m=>{if(m.status==="recognizing text"&&onProgress)onProgress(Math.round((m.progress||0)*100));}});
+ try{const r=await worker.recognize(source);return r.data.text||"";}finally{await worker.terminate();}
+}
+function parseOcrText(text){
+ let stage="",found=[];
+ for(const raw of text.split(/\r?\n/)){
+  const line=raw.replace(/[|]/g," ").replace(/\s+/g," ").trim();
+  const sm=line.match(/\bStage\s*(\d+[a-z]?)\b/i);if(sm){stage="Stage "+sm[1];if(/^Stage\s*\d+[a-z]?$/i.test(line))continue;}
+  // Rows: lot, optional soil type, frontage, land area, registration, price.
+  const m=line.match(/^\s*(?:Lot\s*)?(\d{1,5})\s+(?:(?:N\/?A|[A-Z]{1,3})\s+)?(\d{1,3}(?:\.\d+)?)\s*m\s+([\d,]+(?:\.\d+)?)\s*(?:sqm|m2|m²)\s+(.+?)\s+(Offers?\s+over\s+)?\$\s*([\d,]+(?:\.\d{2})?)/i);
+  if(!m)continue;
+  const price=Number(m[6].replace(/,/g,""));if(!price)continue;
+  found.push({stage,lot:m[1],frontage:m[2]+"m",area:m[3]+"sqm",registration:m[4].trim(),price,priceQualifier:m[5]?"Offers over":""});
+ }return found;
+}
+
 let pending=null;
 function ensurePdfJs(){
  if(window.pdfjsLib)return Promise.resolve(window.pdfjsLib);
@@ -2417,7 +2439,7 @@ function ensurePdfJs(){
 function install(){
  const work=$('lfCloudLotWorkspace');if(!work||$('lfPdfImporter'))return;
  const el=document.createElement('section');el.id='lfPdfImporter';
- el.innerHTML='<h3>Import developer PDF price list</h3><div class="pdf-note">TEST: Review proposed changes and select individual lots before saving. TEST and LIVE share Supabase, so approved changes will affect LIVE. Supports text-based PDFs like Alford Grove.</div><div class="cloud-row"><label>PDF price list<input type="file" id="lfPdfFile" accept="application/pdf,.pdf"></label><button id="lfPdfPreview" class="cloud-primary" type="button">Preview PDF changes</button></div><div id="lfPdfResults" role="status" class="pdf-note">No PDF selected.</div>';
+ el.innerHTML='<h3>Import developer price list — PDF, JPEG or PNG</h3><div class="pdf-note">TEST: Review extracted details before saving. Images and scanned PDFs use text recognition and may contain errors. TEST and LIVE share Supabase. Offers-over prices require manual review.</div><div class="cloud-row"><label>Developer price list<input type="file" id="lfPdfFile" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png"></label><button id="lfPdfPreview" class="cloud-primary" type="button">Preview price list</button></div><div id="lfPdfResults" role="status" class="pdf-note">No file selected.</div>';
  const editor=$('lfCloudLotEditor');work.insertBefore(el,editor||$('lfCloudLotTable'));
  $('lfPdfPreview').onclick=preview;
  $('lfPdfFile').onchange=clearPending; $('lfCloudLotFilter').addEventListener('change',clearPending);
@@ -2470,15 +2492,34 @@ function normalizedRegistration(value){
 async function preview(){
  const out=$('lfPdfResults'),file=$('lfPdfFile')?.files?.[0],estateId=$('lfCloudLotFilter')?.value;
  try{
-  if(!file)throw Error('Choose a PDF file first.');if(file.size>15*1024*1024)throw Error('PDF exceeds 15 MB.');
+  if(!file)throw Error('Choose a PDF, JPG or PNG file first.');if(file.size>15*1024*1024)throw Error('File exceeds 15 MB.');
   if(estateId==='all')throw Error('Please select a specific estate in the Estate dropdown above.');
-  out.textContent='Reading PDF locally in your browser…';
-  const pdfjs=await ensurePdfJs(),data=new Uint8Array(await file.arrayBuffer()),doc=await pdfjs.getDocument({data}).promise;
+  const isPdf=file.type==='application/pdf'||/\.pdf$/i.test(file.name),isImage=/^image\/(jpeg|png)$/.test(file.type)||/\.(jpe?g|png)$/i.test(file.name);
+  if(!isPdf&&!isImage)throw Error('Only PDF, JPG and PNG price lists are supported.');
+  out.textContent='Reading file locally in your browser…';
   let parsed=[];
-  for(let pageNo=1;pageNo<=Math.min(doc.numPages,15);pageNo++){
-   const page=await doc.getPage(pageNo),content=await page.getTextContent();parsed.push(...parse(textRows(content.items)));
+  if(isImage){
+   const imageUrl=URL.createObjectURL(file);
+   try{const recognized=await ocrImage(imageUrl,p=>out.textContent='Reading image text… '+p+'%');parsed=parseOcrText(recognized);}
+   finally{URL.revokeObjectURL(imageUrl);}
+  }else{
+   const pdfjs=await ensurePdfJs(),data=new Uint8Array(await file.arrayBuffer()),doc=await pdfjs.getDocument({data}).promise;
+   for(let pageNo=1;pageNo<=Math.min(doc.numPages,15);pageNo++){
+    const page=await doc.getPage(pageNo),content=await page.getTextContent();
+    const wordRows=textRows(content.items);
+    let pageParsed=parse(wordRows);
+    if(!pageParsed.length){pageParsed=parseOcrText(wordRows.map(row=>row.map(w=>w.t).join(' ')).join('\n'));}
+    if(!pageParsed.length){
+     out.textContent='Scanning PDF page '+pageNo+' of '+Math.min(doc.numPages,15)+'…';
+     const viewport=page.getViewport({scale:2});const canvas=document.createElement('canvas');canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);
+     await page.render({canvasContext:canvas.getContext('2d'),viewport}).promise;
+     pageParsed=parseOcrText(await ocrImage(canvas,p=>out.textContent='Reading PDF page '+pageNo+'… '+p+'%'));
+     canvas.width=canvas.height=0;
+    }
+    parsed.push(...pageParsed);
+   }
   }
-  if(!parsed.length)throw Error('No supported pricing rows detected. This PDF may be scanned or use another layout. Nothing was changed.');
+  if(!parsed.length)throw Error('No supported pricing rows detected. The layout may need a tailored reader. Nothing was changed.');
   const name=$('lfCloudLotFilter').selectedOptions[0]?.textContent||'';
   const client=window.__lfLotImportClient;
   if(!client)throw Error('Lot Management authentication is unavailable.');
@@ -2488,7 +2529,7 @@ async function preview(){
   const existing=a.data||[],stages=b.data||[],duplicate=new Set();
   const rows=parsed.map(p=>{
    const key=p.stage.toLowerCase()+'|'+p.lot.toLowerCase(),isDup=duplicate.has(key);duplicate.add(key);
-   const stage=stages.find(s=>s.name.trim().toLowerCase()===p.stage.toLowerCase());
+   const stage=p.stage?stages.find(s=>s.name.trim().toLowerCase()===p.stage.toLowerCase()):(stages.length===1?stages[0]:null);
    const matches=existing.filter(l=>String(l.lot_number).trim().toLowerCase()===p.lot.toLowerCase());
    const old=stage?matches.find(l=>l.stage_id===stage.id):null;
    const conflict=matches.length>1||(matches.length===1&&!old);
@@ -2498,23 +2539,23 @@ async function preview(){
     if(p.area&&measurementChanged(old.area,p.area,'area'))changes.area=p.area.trim();
     if(p.registration&&normalizedRegistration(old.title)!==normalizedRegistration(p.registration))changes.title=p.registration.trim();
    }
-   const blocked=isDup||!stage||conflict;
-   const flag=isDup?'Duplicate in PDF':!stage?'Stage not found':conflict?'Lot number conflict':!old?'New lot':Object.keys(changes).length?'Update':'No change';
+   const blocked=isDup||!stage||conflict||!!p.priceQualifier;
+   const flag=isDup?'Duplicate in file':!stage?'Stage missing or ambiguous':conflict?'Lot number conflict':p.priceQualifier?'Offers over — manual review':!old?'New lot':Object.keys(changes).length?'Update':'No change';
    return {...p,stageId:stage?.id,old,changes,flag,blocked};
   });
   pending={estateId,name,rows,fileName:file.name};
   renderPending();
- }catch(e){out.textContent='PDF preview: '+e.message;}
+ }catch(e){out.textContent='Import preview: '+e.message;}
 }
 function renderPending(){
  const out=$('lfPdfResults');if(!pending||!out)return;
  const {name,rows}=pending,issues=rows.filter(r=>r.blocked).length,actionable=rows.filter(r=>!r.blocked&&r.flag!=='No change').length;
- out.innerHTML='<p><b>'+esc(name)+'</b> · '+rows.length+' PDF rows · '+issues+' needing attention · '+actionable+' proposed changes. <b>Nothing saved yet.</b></p>'+ 
+ out.innerHTML='<p><b>'+esc(name)+'</b> · '+rows.length+' extracted rows · '+issues+' needing attention · '+actionable+' proposed changes. <b>Nothing saved yet.</b></p>'+ 
  '<div class="cloud-row"><button type="button" id="lfPdfSelectAll">Select all changes</button><button type="button" id="lfPdfSelectNone">Clear selection</button></div>'+ 
  '<div class="pdf-table-wrap"><table><thead><tr><th>Apply</th><th>Stage</th><th>Lot</th><th>Current price</th><th>PDF price</th><th>Changes</th><th>Result</th></tr></thead><tbody>'+rows.map((r,i)=>{
  const ok=!r.blocked&&r.flag!=='No change';const desc=r.flag==='New lot'?'New lot: price, frontage, area, registration':Object.keys(r.changes).map(k=>k+': '+(r.old?.[k]??'—')+' → '+r.changes[k]).join('; ')||'—';
  return '<tr><td><input type="checkbox" data-pdf-check="'+i+'" '+(ok?'checked':'disabled')+'></td><td>'+esc(r.stage)+'</td><td>'+esc(r.lot)+'</td><td>'+(r.old?.price==null?'—':'$'+Number(r.old.price).toLocaleString('en-AU'))+'</td><td>$'+r.price.toLocaleString('en-AU')+'</td><td>'+esc(desc)+'</td><td>'+esc(r.flag)+'</td></tr>';}).join('')+'</tbody></table></div>'+ 
- '<p class="pdf-note pdf-alert">Statuses never change from PDF imports. Lots absent from the PDF are untouched. Blank PDF fields do not erase saved data. Approved changes update the shared LIVE database.</p>'+ 
+ '<p class="pdf-note pdf-alert">Check all extracted numbers carefully, especially images. Offers-over prices are blocked from automatic saving. Statuses never change from imports. Lots absent from the PDF are untouched. Blank PDF fields do not erase saved data. Approved changes update the shared LIVE database.</p>'+ 
  '<button type="button" id="lfPdfApprove" class="cloud-primary" '+(actionable?'':'disabled')+'>Review & approve selected changes</button><p id="lfPdfSaveMessage" role="status" class="pdf-note"></p>';
  $('lfPdfSelectAll').onclick=()=>out.querySelectorAll('[data-pdf-check]:not(:disabled)').forEach(c=>c.checked=true);
  $('lfPdfSelectNone').onclick=()=>out.querySelectorAll('[data-pdf-check]').forEach(c=>c.checked=false);
