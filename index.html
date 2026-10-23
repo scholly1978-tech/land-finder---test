@@ -468,6 +468,14 @@ body{background:#f5f2ee}
 @media(max-width:900px){.home .cards{grid-template-columns:1fr 1fr}.choice-grid{grid-template-columns:1fr 1fr!important}.priority-grid{grid-template-columns:1fr 1fr!important}}
 @media(max-width:600px){.header{padding:10px 14px}.header .tag{display:none}.home{padding:35px 16px 50px}.home h1{font-size:38px}.home .cards{grid-template-columns:1fr}.home .card{min-height:150px}.details,.finder,.enquiry{padding:24px 14px 50px}.finder h1{font-size:32px}.choice-grid,.priority-grid{grid-template-columns:1fr!important}.finder-section{padding:17px}.success-panel{margin:4vh 14px!important;padding:30px 20px!important}.lot-hero-title{font-size:36px!important}}
 </style>
+<style>
+.lf-import-edit-backdrop{position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;padding:16px}
+.lf-import-edit-dialog{width:min(640px,100%);max-height:92vh;overflow:auto;background:white;color:#2d241d;border-radius:16px;padding:22px;box-shadow:0 16px 55px rgba(0,0,0,.3)}
+.lf-import-edit-heading{display:flex;justify-content:space-between;gap:12px}.lf-import-edit-heading h3{margin:0 0 8px;font-size:22px}.lf-import-edit-heading p{font-size:13px;color:#666;line-height:1.5;margin:0 0 20px}.lf-import-edit-heading button{height:35px;min-width:35px;border:0;border-radius:50%;font-size:23px}
+.lf-import-edit-fields{display:grid;grid-template-columns:1fr 1fr;gap:14px}.lf-import-edit-fields label{display:flex;flex-direction:column;gap:7px;font-size:13px;font-weight:700}.lf-import-edit-fields input,.lf-import-edit-fields select{width:100%;padding:12px;border:1px solid #bbc2c7;border-radius:8px;background:white;color:#222}
+.lf-import-edit-error{color:#a11;font-size:13px;min-height:18px}.lf-import-edit-footer,.lf-import-edit-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px}.lf-import-edit-footer button,.lf-import-edit-actions button{border:1px solid #bfc6c8;background:#f7f8f8;border-radius:8px;padding:10px 13px;font-weight:700}.lf-import-edit-footer button:disabled{opacity:.4;cursor:not-allowed}.lf-import-edit-footer span{font-size:12px;color:#666}.lf-import-edit-actions{justify-content:flex-end;border-top:1px solid #ddd;padding-top:16px}.lf-import-edit-actions #lfEditSave{background:#184b3e;color:white;border-color:#184b3e}
+@media(max-width:560px){.lf-import-edit-fields{grid-template-columns:1fr}.lf-import-edit-footer{flex-wrap:wrap}}
+</style>
 </head>
 <body data-prototype="26" data-build="final-polish">
 <header class="header">
@@ -2643,21 +2651,77 @@ function recalculateDraft(){
  });
  Object.assign(pending,{rows,missing,unexpected,unsafeList});
 }
+// One-window correction editor. All changes remain in the local import preview.
+let importEditorIndex=-1;
+function importEditorClose(){const m=document.getElementById('lfImportEditModal');if(m)m.remove();importEditorIndex=-1;}
 function editImportRow(i){
  if(!pending||!pending.draft[i])return;
+ importEditorIndex=i;
  const row=pending.draft[i];
- const lot=prompt('Lot number (check against the original developer list):',row.lot);if(lot===null)return;
- const stage=prompt('Stage (must match an existing estate stage):',row.stage);if(stage===null)return;
- const area=prompt('Lot area in sqm:',row.area||'');if(area===null)return;
- const price=prompt('Fixed price in dollars (not offers-over):',String(row.price||''));if(price===null)return;
- const status=prompt('Developer status: Available, On Hold, Sold, Off Market:',row.sourceStatus||'Available');if(status===null)return;
- const statusMap={'available':'Available','on hold':'On Hold','hold':'On Hold','sold':'Sold','off market':'Off Market'};
- const normalized=statusMap[status.trim().toLowerCase()];
- if(!/^\d{1,5}$/.test(lot.trim())||!pending.stages.some(s=>s.name.toLowerCase()===stage.trim().toLowerCase())||comparableMeasurement(area,'area')===null||!Number.isFinite(Number(price.replace(/[$,\s]/g,'')))||Number(price.replace(/[$,\s]/g,''))<=0||!normalized){alert('Invalid entry. Check lot number, existing stage, area, fixed price and status.');return;}
- if(pending.draft.some((other,j)=>j!==i&&String(other.lot).trim()===String(Number(lot.trim()))&&String(other.stage).trim().toLowerCase()===stage.trim().toLowerCase())){alert('This lot already exists in the preview. Edit the existing row or remove the incorrect OCR row first. Nothing changed.');return;}
- if(!confirm('I have checked Lot '+lot.trim()+' against the ORIGINAL developer price list, including price, area and status. Apply this correction to the preview only?'))return;
- pending.draft[i]={...row,lot:String(Number(lot.trim())),stage:stage.trim(),area:area.trim(),price:Number(price.replace(/[$,\s]/g,'')),sourceStatus:normalized,priceQualifier:'',ocrConflict:false,manuallyVerified:true};
- recalculateDraft();renderPending();
+ let modal=document.getElementById('lfImportEditModal');
+ if(!modal){
+  modal=document.createElement('div');modal.id='lfImportEditModal';modal.className='lf-import-edit-backdrop';
+  modal.innerHTML=`<div class="lf-import-edit-dialog" role="dialog" aria-modal="true" aria-labelledby="lfImportEditHeading">
+   <div class="lf-import-edit-heading"><div><h3 id="lfImportEditHeading">Correct imported lot</h3><p>Check each value against the original developer price list. Changes stay in the preview until you approve an import.</p></div><button type="button" id="lfImportEditClose" aria-label="Close editor">×</button></div>
+   <div class="lf-import-edit-fields">
+    <label>Lot number<input id="lfEditLot" inputmode="numeric"></label>
+    <label>Stage<select id="lfEditStage"></select></label>
+    <label>Land area (m²)<input id="lfEditArea" inputmode="decimal"></label>
+    <label>Price (AUD)<input id="lfEditPrice" inputmode="decimal"></label>
+    <label>Availability status<select id="lfEditStatus"><option>Available</option><option>On Hold</option><option>Sold</option><option>Off Market</option></select></label>
+   </div>
+   <p id="lfImportEditError" class="lf-import-edit-error" role="alert"></p>
+   <div class="lf-import-edit-footer"><button type="button" id="lfEditPrevious">← Previous lot</button><span id="lfEditPosition"></span><button type="button" id="lfEditNext">Next lot →</button></div>
+   <div class="lf-import-edit-actions"><button type="button" id="lfEditCancel">Cancel</button><button type="button" id="lfEditSave">Save to Preview</button></div>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.querySelector('#lfImportEditClose').onclick=importEditorClose;
+  modal.querySelector('#lfEditCancel').onclick=importEditorClose;
+  modal.querySelector('#lfEditSave').onclick=()=>saveImportEditor(false);
+  modal.querySelector('#lfEditPrevious').onclick=()=>saveImportEditor(true,-1);
+  modal.querySelector('#lfEditNext').onclick=()=>saveImportEditor(true,1);
+  modal.addEventListener('click',e=>{if(e.target===modal)importEditorClose();});
+ }
+ const get=id=>modal.querySelector('#'+id);
+ get('lfEditLot').value=row.lot;
+ get('lfEditStage').innerHTML=pending.stages.map(st=>'<option value="'+esc(st.name)+'">'+esc(st.name)+'</option>').join('');
+ get('lfEditStage').value=row.stage;
+ get('lfEditArea').value=row.area||'';
+ get('lfEditPrice').value=Number.isFinite(Number(row.price))?String(row.price):'';
+ get('lfEditStatus').value=row.sourceStatus||'Available';
+ get('lfImportEditError').textContent='';
+ get('lfEditPosition').textContent='Lot '+row.lot+' · '+(i+1)+' of '+pending.draft.length;
+ get('lfEditPrevious').disabled=i===0;
+ get('lfEditNext').disabled=i===pending.draft.length-1;
+ get('lfEditLot').focus();
+}
+function saveImportEditor(navigate=false,direction=0){
+ if(!pending||importEditorIndex<0)return;
+ const modal=document.getElementById('lfImportEditModal');if(!modal)return;
+ const val=id=>modal.querySelector('#'+id).value.trim();
+ const lot=val('lfEditLot'),stage=val('lfEditStage'),area=val('lfEditArea'),priceText=val('lfEditPrice'),status=val('lfEditStatus');
+ const price=Number(priceText.replace(/[$,\s]/g,''));
+ const err=modal.querySelector('#lfImportEditError');
+ if(!/^\d{1,5}$/.test(lot)||!pending.stages.some(st=>st.name.toLowerCase()===stage.toLowerCase())||comparableMeasurement(area,'area')===null||!Number.isFinite(price)||price<=0||!['Available','On Hold','Sold','Off Market'].includes(status)){
+  err.textContent='Please enter a valid lot number, existing stage, area, fixed price and status.';return;
+ }
+ if(pending.draft.some((r,j)=>j!==importEditorIndex&&String(r.lot).trim()===String(Number(lot))&&String(r.stage).trim().toLowerCase()===stage.toLowerCase())){
+  err.textContent='This lot number already exists in this stage. Remove the incorrect OCR row or edit the existing entry.';return;
+ }
+ const old=pending.draft[importEditorIndex];
+ const changed=String(old.lot)!==String(Number(lot))||old.stage!==stage||String(old.area||'')!==area||Number(old.price)!==price||String(old.sourceStatus||'Available')!==status;
+ // An explicit save also verifies a previously flagged OCR conflict against the original list.
+ if(!navigate||changed){
+  if(!confirm('Confirm Stage '+stage+' Lot '+lot+' has been checked against the ORIGINAL developer list, including area, price and status. Save to preview only?'))return;
+  pending.draft[importEditorIndex]={...old,lot:String(Number(lot)),stage,area,price,sourceStatus:status,priceQualifier:'',ocrConflict:false,manuallyVerified:true};
+  recalculateDraft();renderPending();
+ }
+ if(navigate){
+  const nextLot=String(Number(lot));
+  const currentIndex=pending.draft.findIndex(r=>String(r.lot)===nextLot&&r.stage.toLowerCase()===stage.toLowerCase());
+  const next=Math.max(0,Math.min(pending.draft.length-1,(currentIndex>=0?currentIndex:importEditorIndex)+direction));
+  editImportRow(next);
+ }else importEditorClose();
 }
 function addMissingImportRow(){
  if(!pending)return;
