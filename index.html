@@ -2607,32 +2607,66 @@ async function preview(){
   const missing=expectedGowrie?Array.from({length:28},(_,i)=>i+1).filter(n=>!present.has(n)):[];
   const unexpected=expectedGowrie?uniqueParsed.filter(r=>!Number.isInteger(Number(r.lot))||Number(r.lot)<1||Number(r.lot)>28).map(r=>r.lot):[];
   const unsafeList=expectedGowrie&&(missing.length>0||unexpected.length>0||uniqueParsed.length!==28);
-  const rows=uniqueParsed.map(p=>{
-   const isDup=false;
-   const matches=existing.filter(l=>String(l.lot_number).trim().toLowerCase()===p.lot.toLowerCase());
-   // A stage-free developer list can match an EXISTING lot only when its number
-   // occurs exactly once in the selected estate. Never guess for duplicate lots.
-   // For new lots, a single configured estate stage is the only safe fallback.
-   const stage=p.stage
-    ? stages.find(s=>s.name.trim().toLowerCase()===p.stage.trim().toLowerCase())
-    : matches.length===1
-      ? stages.find(s=>s.id===matches[0].stage_id)
-      : matches.length===0&&stages.length===1 ? stages[0] : null;
-   const old=stage?matches.find(l=>l.stage_id===stage.id):null;
-   const conflict=matches.length>1||(matches.length===1&&!old);
-   const changes={};
-   if(old){if(Number(old.price)!==p.price)changes.price=p.price;
-    if(p.frontage&&measurementChanged(old.frontage,p.frontage,'frontage'))changes.frontage=p.frontage.trim();
-    if(p.area&&measurementChanged(old.area,p.area,'area'))changes.area=p.area.trim();
-    if(p.registration&&normalizedRegistration(old.title)!==normalizedRegistration(p.registration))changes.title=p.registration.trim();
-   }
-   const blocked=unsafeList||p.ocrConflict||isDup||!stage||conflict||!!p.priceQualifier;
-   const flag=p.ocrConflict?'Conflicting PDF readings — manual review':unsafeList?'Incomplete/invalid lot list — blocked':isDup?'Duplicate in file':!stage?'Stage missing or ambiguous':conflict?'Lot number conflict':p.priceQualifier?'Offers over — manual review':!old?'New lot':Object.keys(changes).length?'Update':'No change';
-   return {...p,stage:stage?.name||p.stage,stageId:stage?.id,old,changes,flag,blocked};
-  });
-  pending={estateId,name,rows,fileName:file.name,rawCount:parsed.length,missing,unexpected,unsafeList};
+  pending={estateId,name,rows:[],draft:uniqueParsed.map(r=>({...r})),existing,stages,fileName:file.name,rawCount:parsed.length,missing:[],unexpected:[],unsafeList:false};
+  recalculateDraft();
   renderPending();
  }catch(e){out.textContent='Import preview: '+e.message;}
+}
+function recalculateDraft(){
+ if(!pending)return;
+ const {name,existing,stages}=pending;
+ const uniqueParsed=pending.draft.map(r=>({...r,lot:String(r.lot||'').trim(),stage:String(r.stage||'').trim(),price:Number(r.price)}));
+ const expectedGowrie=/^gowrie station$/i.test(name.trim());
+ const counts=new Map();for(const r of uniqueParsed){const k=r.stage.toLowerCase()+'|'+r.lot.toLowerCase();counts.set(k,(counts.get(k)||0)+1);}
+ const present=new Set(uniqueParsed.map(r=>Number(r.lot)));
+ const missing=expectedGowrie?Array.from({length:28},(_,i)=>i+1).filter(n=>!present.has(n)):[];
+ const unexpected=expectedGowrie?uniqueParsed.filter(r=>!Number.isInteger(Number(r.lot))||Number(r.lot)<1||Number(r.lot)>28).map(r=>r.lot):[];
+ const unsafeList=expectedGowrie&&(missing.length>0||unexpected.length>0||uniqueParsed.length!==28);
+ const rows=uniqueParsed.map(p=>{
+  const duplicate=(counts.get(p.stage.toLowerCase()+'|'+p.lot.toLowerCase())||0)>1;
+  const matches=existing.filter(l=>String(l.lot_number).trim().toLowerCase()===p.lot.toLowerCase());
+  const stage=p.stage?stages.find(s=>s.name.trim().toLowerCase()===p.stage.toLowerCase()):matches.length===1?stages.find(s=>s.id===matches[0].stage_id):matches.length===0&&stages.length===1?stages[0]:null;
+  const old=stage?matches.find(l=>l.stage_id===stage.id):null;
+  const conflict=matches.length>1||(matches.length===1&&!old);
+  const changes={};
+  if(old){if(Number(old.price)!==p.price)changes.price=p.price;
+   if(p.frontage&&measurementChanged(old.frontage,p.frontage,'frontage'))changes.frontage=p.frontage.trim();
+   if(p.area&&measurementChanged(old.area,p.area,'area'))changes.area=p.area.trim();
+   if(p.registration&&normalizedRegistration(old.title)!==normalizedRegistration(p.registration))changes.title=p.registration.trim();}
+  const blocked=unsafeList||duplicate||(p.ocrConflict&&!p.manuallyVerified)||!stage||conflict||!!p.priceQualifier||!Number.isFinite(p.price)||p.price<=0||!p.area;
+  const flag=duplicate?'Duplicate lot number — correct manually':(p.ocrConflict&&!p.manuallyVerified)?'Conflicting OCR — verify manually':unsafeList?'Incomplete/invalid lot list — blocked':!stage?'Stage missing or ambiguous':conflict?'Existing lot conflict':p.priceQualifier?'Offers over — manual review':!Number.isFinite(p.price)||p.price<=0||!p.area?'Missing price or area':!old?'New lot':Object.keys(changes).length?'Update':'No change';
+  return {...p,stage:stage?.name||p.stage,stageId:stage?.id,old,changes,flag,blocked};
+ });
+ Object.assign(pending,{rows,missing,unexpected,unsafeList});
+}
+function editImportRow(i){
+ if(!pending||!pending.draft[i])return;
+ const row=pending.draft[i];
+ const lot=prompt('Lot number (check against the original developer list):',row.lot);if(lot===null)return;
+ const stage=prompt('Stage (must match an existing estate stage):',row.stage);if(stage===null)return;
+ const area=prompt('Lot area in sqm:',row.area||'');if(area===null)return;
+ const price=prompt('Fixed price in dollars (not offers-over):',String(row.price||''));if(price===null)return;
+ const status=prompt('Developer status: Available, On Hold, Sold, Off Market:',row.sourceStatus||'Available');if(status===null)return;
+ const statusMap={'available':'Available','on hold':'On Hold','hold':'On Hold','sold':'Sold','off market':'Off Market'};
+ const normalized=statusMap[status.trim().toLowerCase()];
+ if(!/^\d{1,5}$/.test(lot.trim())||!pending.stages.some(s=>s.name.toLowerCase()===stage.trim().toLowerCase())||comparableMeasurement(area,'area')===null||!Number.isFinite(Number(price.replace(/[$,\s]/g,'')))||Number(price.replace(/[$,\s]/g,''))<=0||!normalized){alert('Invalid entry. Check lot number, existing stage, area, fixed price and status.');return;}
+ if(!confirm('I have checked Lot '+lot.trim()+' against the ORIGINAL developer price list, including price, area and status. Apply this correction to the preview only?'))return;
+ pending.draft[i]={...row,lot:lot.trim(),stage:stage.trim(),area:area.trim(),price:Number(price.replace(/[$,\s]/g,'')),sourceStatus:normalized,manuallyVerified:true};
+ recalculateDraft();renderPending();
+}
+function addMissingImportRow(){
+ if(!pending)return;
+ const lot=prompt('Missing lot number (from original developer price list):',String(pending.missing[0]||''));if(lot===null)return;
+ const stage=prompt('Stage:',pending.stages.length===1?pending.stages[0].name:'');if(stage===null)return;
+ const area=prompt('Area in sqm from original list:','');if(area===null)return;
+ const price=prompt('Fixed price in dollars from original list:','');if(price===null)return;
+ const status=prompt('Developer status: Available, On Hold, Sold, Off Market:','');if(status===null)return;
+ const normalized={'available':'Available','on hold':'On Hold','hold':'On Hold','sold':'Sold','off market':'Off Market'}[status.trim().toLowerCase()];
+ const num=Number(price.replace(/[$,\s]/g,''));
+ if(!/^\d{1,5}$/.test(lot.trim())||!pending.stages.some(s=>s.name.toLowerCase()===stage.trim().toLowerCase())||comparableMeasurement(area,'area')===null||!Number.isFinite(num)||num<=0||!normalized){alert('Invalid entry. No changes made.');return;}
+ if(!confirm('Confirm all details for Lot '+lot.trim()+' were checked against the ORIGINAL developer list. Add to preview only?'))return;
+ pending.draft.push({lot:lot.trim(),stage:stage.trim(),area:area.trim(),price:num,sourceStatus:normalized,frontage:'',registration:'',priceQualifier:'',manuallyVerified:true});
+ recalculateDraft();renderPending();
 }
 function renderPending(){
  const out=$('lfPdfResults');if(!pending||!out)return;
@@ -2641,12 +2675,14 @@ function renderPending(){
  (pending.missing.length?'<p class="pdf-note pdf-alert"><b>Missing expected lots:</b> '+pending.missing.join(', ')+'. Import is blocked until all 28 are identified.</p>':'')+
  (pending.unexpected.length?'<p class="pdf-note pdf-alert"><b>Unexpected lot numbers:</b> '+pending.unexpected.map(esc).join(', ')+'. Import is blocked.</p>':'')+
  (rows.some(r=>r.ocrConflict)?'<p class="pdf-note pdf-alert">Conflicting OCR readings were found for some lots. Those lots are blocked pending manual verification.</p>':'')+ 
- '<div class="cloud-row"><button type="button" id="lfPdfSelectAll">Select all changes</button><button type="button" id="lfPdfSelectNone">Clear selection</button></div>'+ 
- '<div class="pdf-table-wrap"><table><thead><tr><th>Apply</th><th>Stage</th><th>Lot</th><th>Current price</th><th>PDF price</th><th>Changes</th><th>Result</th></tr></thead><tbody>'+rows.map((r,i)=>{
+ '<div class="cloud-row"><button type="button" id="lfPdfAddMissing">+ Add missing lot to preview</button><button type="button" id="lfPdfSelectAll">Select all changes</button><button type="button" id="lfPdfSelectNone">Clear selection</button></div>'+ 
+ '<div class="pdf-table-wrap"><table><thead><tr><th>Apply</th><th>Stage</th><th>Lot</th><th>Current price</th><th>PDF price</th><th>Changes</th><th>Result</th><th>Correct</th></tr></thead><tbody>'+rows.map((r,i)=>{
  const ok=!r.blocked&&r.flag!=='No change';const desc=r.flag==='New lot'?'New lot: price, area, '+(r.sourceStatus?'status '+r.sourceStatus:'status confirmation required'):Object.keys(r.changes).map(k=>k+': '+(r.old?.[k]??'—')+' → '+r.changes[k]).join('; ')||'—';
  return '<tr><td><input type="checkbox" data-pdf-check="'+i+'" '+(ok?'checked':'disabled')+'></td><td>'+esc(r.stage)+'</td><td>'+esc(r.lot)+'</td><td>'+(r.old?.price==null?'—':'$'+Number(r.old.price).toLocaleString('en-AU'))+'</td><td>$'+r.price.toLocaleString('en-AU')+'</td><td>'+esc(desc)+'</td><td>'+esc(r.flag)+'</td></tr>';}).join('')+'</tbody></table></div>'+ 
  '<p class="pdf-note pdf-alert">Check all extracted numbers carefully, especially images. Offers-over prices are blocked from automatic saving. Existing lot statuses never change from imports. New lot statuses require individual confirmation. Lots absent from the PDF are untouched. Blank PDF fields do not erase saved data. Approved changes update the shared LIVE database.</p>'+ 
  '<button type="button" id="lfPdfApprove" class="cloud-primary" '+(actionable?'':'disabled')+'>Review & approve selected changes</button><p id="lfPdfSaveMessage" role="status" class="pdf-note"></p>';
+ $('lfPdfAddMissing').onclick=addMissingImportRow;
+ out.querySelectorAll('[data-pdf-edit]').forEach(b=>b.onclick=()=>editImportRow(Number(b.dataset.pdfEdit)));
  $('lfPdfSelectAll').onclick=()=>out.querySelectorAll('[data-pdf-check]:not(:disabled)').forEach(c=>c.checked=true);
  $('lfPdfSelectNone').onclick=()=>out.querySelectorAll('[data-pdf-check]').forEach(c=>c.checked=false);
  $('lfPdfApprove').onclick=approve;
@@ -2655,6 +2691,7 @@ async function approve(){
  const out=$('lfPdfResults'),msg=$('lfPdfSaveMessage');if(!pending)return;
  const selection=[...out.querySelectorAll('[data-pdf-check]:checked')].map(c=>pending.rows[Number(c.dataset.pdfCheck)]);
  if(!selection.length){msg.textContent='Select at least one changed lot.';return;}
+ recalculateDraft();if(pending.rows.some(r=>r.blocked)){msg.textContent='Resolve all preview warnings before saving. Nothing saved.';return;}
  if($('lfCloudLotFilter').value!==pending.estateId){clearPending();return;}
  const client=window.__lfLotImportClient;const user=await client.auth.getUser();if(!user.data?.user){msg.textContent='Sign in again before saving.';return;}
  // Re-read selected records to guard against changes since the preview.
