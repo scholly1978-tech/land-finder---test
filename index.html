@@ -2461,7 +2461,11 @@ function measurementChanged(existing,incoming,unit){
  if(a!==null&&b!==null)return Math.abs(a-b)>0.000001;
  return String(existing??'').trim().toLowerCase()!==String(incoming??'').trim().toLowerCase();
 }
-function normalizedRegistration(value){return String(value??'').trim().replace(/\s+/g,' ').toLowerCase();}
+function normalizedRegistration(value){
+ const months={jan:'january',feb:'february',mar:'march',apr:'april',may:'may',jun:'june',jul:'july',aug:'august',sep:'september',sept:'september',oct:'october',nov:'november',dec:'december'};
+ return String(value??'').trim().toLowerCase().replace(/\b(jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b\.?/g,(_,abbr)=>months[abbr])
+  .replace(/\s+/g,' ').trim();
+}
 
 async function preview(){
  const out=$('lfPdfResults'),file=$('lfPdfFile')?.files?.[0],estateId=$('lfCloudLotFilter')?.value;
