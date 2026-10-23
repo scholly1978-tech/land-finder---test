@@ -1983,7 +1983,8 @@ async function refreshCloud(){
    const key=String(e.estate_key||'').trim();
    // The existing kiosk uses wal / alf / gow, or estateKeyFor(i) for added estates.
    const known=typeof DB!=='undefined' && (Object.prototype.hasOwnProperty.call(DB,key)|| (typeof getEstateRecords==='function'&&getEstateRecords().some((_,i)=>estateKeyFor(i)===key)));
-   if(!known)continue;
+   // Cloud estates are not limited to the three original kiosk keys.
+   if(!key)continue;
    matched++;
    const records=(grouped.get(e.id)||[]).map(l=>[
      String(l.lot_number||''),stageById.get(l.stage_id)||'',String(l.frontage??''),String(l.area??''),String(l.title??''),l.price==null?null:Number(l.price),String(l.status||'Available'),String(l.orientation||''),String(l.street||''),Array.isArray(l.features)?l.features:[]
@@ -2302,6 +2303,96 @@ function startDrag(e){e.preventDefault();e.stopPropagation();dragging=Number(e.t
 function setup(){const svg=$('lfBoundarySVG');svg.addEventListener('pointerdown',e=>{if(!chosen||e.target.classList.contains('vertex'))return;const p=coordinate(e);if(p){points.push(p);draw();}});svg.addEventListener('pointermove',e=>{if(dragging<0)return;const p=coordinate(e);if(p){points[dragging]=p;draw();}});svg.addEventListener('pointerup',()=>dragging=-1);svg.addEventListener('pointercancel',()=>dragging=-1);}
 async function save(){if(!chosen){msg('Select a lot first.',true);return;}if(points.length>0&&points.length<3){msg('Draw at least three points before saving.',true);return;}try{msg('Saving boundary to Supabase…');await req(api.from('lots').update({boundary:points.length?points:null}).eq('id',chosen.id).select('id').single());chosen.boundary=points.length?points.map(p=>p.slice()):null;const estate=estates.find(e=>e.id===chosen.estate_id);if(estate){window.LF_CLOUD_BOUNDARIES=window.LF_CLOUD_BOUNDARIES||{};window.LF_CLOUD_BOUNDARIES[estate.estate_key]=window.LF_CLOUD_BOUNDARIES[estate.estate_key]||{};if(points.length)window.LF_CLOUD_BOUNDARIES[estate.estate_key][String(chosen.lot_number)]=points.map(p=>p.slice());else delete window.LF_CLOUD_BOUNDARIES[estate.estate_key][String(chosen.lot_number)];}const savedLotId=chosen.id,savedLotNumber=chosen.lot_number;renderLots();$('lfBoundaryLot').value=savedLotId;selectLot();msg('Saved Lot '+savedLotNumber+' boundary to Supabase. Refresh the visitor masterplan to see the highlight.');}catch(e){msg('Save failed: '+e.message+'. Check Supabase lots UPDATE permissions.',true);}}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>{init();setup();});else{init();setup();}
+})();
+</script>
+<script>
+/* TEST ONLY — Cloud-driven visitor estate catalogue, October 2026.
+   Reads public active estates and their primary masterplans. No database writes. */
+(function(){
+ 'use strict';
+ const ROOT='https://ajlbququbswnmzmbkiro.supabase.co/rest/v1/';
+ const KEY='sb_publishable_BV5evD2xFxRCoVCbFrWwzw_eqTByI43';
+ const cloudEstates=new Map();
+ let catalogReady=false;
+ async function get(table,query){
+   const r=await fetch(ROOT+table+'?'+query,{headers:{apikey:KEY,Authorization:'Bearer '+KEY,Accept:'application/json'},cache:'no-store'});
+   if(!r.ok)throw new Error(table+' HTTP '+r.status);
+   return r.json();
+ }
+ function safeKey(v){return String(v||'').trim();}
+ function showCloudEstate(key){
+   const e=cloudEstates.get(key);
+   if(!e||!e.image){alert('This estate does not have a masterplan available yet.');return;}
+   // The original kiosk's openEstate() is wrapped by its cloud refresh integration.
+   window.openEstate(e.name,key);
+   const img=document.getElementById('masterImage');
+   img.src=e.image;
+   const hint=document.getElementById('mapHint');
+   if(hint)hint.textContent='Choose an available lot from the list. Highlighted lots will appear once boundaries are drawn.';
+   function align(){
+     if(currentKey!==key||!img.naturalWidth||!img.naturalHeight)return;
+     const svg=document.getElementById('overlay'), host=img.parentElement;
+     if(!svg||!host)return;
+     // Match the image's object-fit:contain rectangle, so cloud boundary coordinates line up.
+     const w=host.clientWidth,h=host.clientHeight,scale=Math.min(w/img.naturalWidth,h/img.naturalHeight);
+     const dw=img.naturalWidth*scale,dh=img.naturalHeight*scale;
+     svg.style.left=((w-dw)/2)+'px';svg.style.top=((h-dh)/2)+'px';
+     svg.style.width=dw+'px';svg.style.height=dh+'px';svg.style.right='auto';svg.style.bottom='auto';
+     svg.setAttribute('viewBox','0 0 '+img.naturalWidth+' '+img.naturalHeight);
+     svg.setAttribute('preserveAspectRatio','none');
+     // buildOverlay() sets legacy dimensions; correct them after it runs.
+   }
+   img.addEventListener('load',()=>{if(currentKey!==key)return;buildOverlay();align();},{once:true});
+   if(img.complete&&img.naturalWidth){buildOverlay();align();}
+   window.__lfCloudAlign=align;
+ }
+ function renderCatalog(){
+   const host=document.querySelector('#home .cards');if(!host||!cloudEstates.size)return;
+   host.replaceChildren();
+   for(const [key,e] of cloudEstates){
+     const card=document.createElement('div');card.className='card';
+     const top=document.createElement('div'),pill=document.createElement('span');pill.className='pill';
+     pill.textContent=e.image?'Available to explore':'Coming soon';
+     const title=document.createElement('h2');title.textContent=e.name;
+     top.append(pill,title);
+     if(e.suburb){const sub=document.createElement('div');sub.textContent=e.suburb;top.append(sub);}
+     const btn=document.createElement('button');btn.className='btn '+(e.image?'primary':'secondary');
+     btn.textContent=e.image?'Explore estate →':'Coming soon';btn.disabled=!e.image;
+     if(e.image)btn.addEventListener('click',()=>showCloudEstate(key));
+     card.append(top,btn);host.append(card);
+   }
+ }
+ async function refreshCatalog(){
+   try{
+     const [estates,plans]=await Promise.all([
+       get('estates','select=id,estate_key,name,active&active=eq.true&limit=1000'),
+       get('masterplans','select=estate_id,image_url,is_primary,sort_order&limit=1000')
+     ]);
+     const byEstate=new Map();
+     for(const p of plans){if(!p.image_url)continue;const prior=byEstate.get(p.estate_id);
+       if(!prior||(!prior.is_primary&&p.is_primary)||prior.is_primary===p.is_primary&&Number(p.sort_order||0)<Number(prior.sort_order||0))byEstate.set(p.estate_id,p);
+     }
+     cloudEstates.clear();
+     for(const e of estates){const key=safeKey(e.estate_key);if(!key)continue;
+       cloudEstates.set(key,{name:e.name||key,image:byEstate.get(e.id)?.image_url||'',suburb:''});
+     }
+     renderCatalog();catalogReady=true;
+   }catch(err){console.warn('Cloud estate catalogue unavailable; keeping existing home cards.',err);}
+ }
+ // For newly added estates, correct the overlay size after the legacy buildOverlay runs.
+ const oldBuild=window.buildOverlay;
+ window.buildOverlay=function(...args){
+   const result=oldBuild.apply(this,args);
+   if(cloudEstates.has(currentKey)){
+     const img=document.getElementById('masterImage'),svg=document.getElementById('overlay');
+     if(img?.naturalWidth&&svg){svg.setAttribute('viewBox','0 0 '+img.naturalWidth+' '+img.naturalHeight);}
+     if(window.__lfCloudAlign)window.__lfCloudAlign();
+   }
+   return result;
+ };
+ window.addEventListener('resize',()=>window.__lfCloudAlign?.());
+ const start=()=>{refreshCatalog();document.getElementById('lfCloudRefresh')?.addEventListener('click',()=>setTimeout(refreshCatalog,250));};
+ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
 })();
 </script>
 </body>
