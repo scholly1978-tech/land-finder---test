@@ -2473,6 +2473,32 @@ function parseOcrText(text){
  }return found.concat(parseSimpleLotTable(text));
 }
 
+// Consolidate repeated OCR passes and pages before comparing against Supabase.
+// Conflicting readings are never chosen automatically or saved.
+function consolidateDeveloperRows(rawRows){
+ const groups=new Map();
+ for(const row of rawRows){
+  const lot=String(row.lot||'').trim().replace(/^0+(?=\d)/,'');
+  const stage=String(row.stage||'').trim().toLowerCase();
+  const key=stage+'|'+lot;
+  if(!groups.has(key))groups.set(key,[]);
+  groups.get(key).push({...row,lot});
+ }
+ const rows=[];
+ for(const variants of groups.values()){
+  const base={...variants[0]};
+  const different=variants.some(v=>
+   Number(v.price)!==Number(base.price)||
+   (comparableMeasurement(v.area,'area')!==comparableMeasurement(base.area,'area'))||
+   (v.sourceStatus&&base.sourceStatus&&String(v.sourceStatus).toLowerCase()!==String(base.sourceStatus).toLowerCase())||
+   (v.priceQualifier||'')!==(base.priceQualifier||''));
+  base.ocrConflict=different;
+  base.ocrCopies=variants.length;
+  rows.push(base);
+ }
+ return rows;
+}
+
 let pending=null;
 function ensurePdfJs(){
  if(window.pdfjsLib)return Promise.resolve(window.pdfjsLib);
@@ -2574,9 +2600,15 @@ async function preview(){
   const user=await client.auth.getUser();if(!user.data?.user)throw Error('Sign in to Lot Management first.');
   const [a,b]=await Promise.all([client.from('lots').select('id,lot_number,stage_id,price,frontage,area,title,status').eq('estate_id',estateId),client.from('stages').select('id,name').eq('estate_id',estateId)]);
   if(a.error||b.error)throw Error('Unable to compare with server inventory: '+(a.error||b.error).message);
-  const existing=a.data||[],stages=b.data||[],duplicate=new Set();
-  const rows=parsed.map(p=>{
-   const key=p.stage.toLowerCase()+'|'+p.lot.toLowerCase(),isDup=duplicate.has(key);duplicate.add(key);
+  const existing=a.data||[],stages=b.data||[];
+  const uniqueParsed=consolidateDeveloperRows(parsed.map(r=>({...r,stage:r.stage||(stages.length===1?stages[0].name:'')})));
+  const expectedGowrie=/^gowrie station$/i.test(name.trim());
+  const present=new Set(uniqueParsed.map(r=>Number(r.lot)));
+  const missing=expectedGowrie?Array.from({length:28},(_,i)=>i+1).filter(n=>!present.has(n)):[];
+  const unexpected=expectedGowrie?uniqueParsed.filter(r=>!Number.isInteger(Number(r.lot))||Number(r.lot)<1||Number(r.lot)>28).map(r=>r.lot):[];
+  const unsafeList=expectedGowrie&&(missing.length>0||unexpected.length>0||uniqueParsed.length!==28);
+  const rows=uniqueParsed.map(p=>{
+   const isDup=false;
    const matches=existing.filter(l=>String(l.lot_number).trim().toLowerCase()===p.lot.toLowerCase());
    // A stage-free developer list can match an EXISTING lot only when its number
    // occurs exactly once in the selected estate. Never guess for duplicate lots.
@@ -2594,18 +2626,21 @@ async function preview(){
     if(p.area&&measurementChanged(old.area,p.area,'area'))changes.area=p.area.trim();
     if(p.registration&&normalizedRegistration(old.title)!==normalizedRegistration(p.registration))changes.title=p.registration.trim();
    }
-   const blocked=isDup||!stage||conflict||!!p.priceQualifier;
-   const flag=isDup?'Duplicate in file':!stage?'Stage missing or ambiguous':conflict?'Lot number conflict':p.priceQualifier?'Offers over — manual review':!old?'New lot':Object.keys(changes).length?'Update':'No change';
+   const blocked=unsafeList||p.ocrConflict||isDup||!stage||conflict||!!p.priceQualifier;
+   const flag=p.ocrConflict?'Conflicting PDF readings — manual review':unsafeList?'Incomplete/invalid lot list — blocked':isDup?'Duplicate in file':!stage?'Stage missing or ambiguous':conflict?'Lot number conflict':p.priceQualifier?'Offers over — manual review':!old?'New lot':Object.keys(changes).length?'Update':'No change';
    return {...p,stage:stage?.name||p.stage,stageId:stage?.id,old,changes,flag,blocked};
   });
-  pending={estateId,name,rows,fileName:file.name};
+  pending={estateId,name,rows,fileName:file.name,rawCount:parsed.length,missing,unexpected,unsafeList};
   renderPending();
  }catch(e){out.textContent='Import preview: '+e.message;}
 }
 function renderPending(){
  const out=$('lfPdfResults');if(!pending||!out)return;
  const {name,rows}=pending,issues=rows.filter(r=>r.blocked).length,actionable=rows.filter(r=>!r.blocked&&r.flag!=='No change').length;
- out.innerHTML='<p><b>'+esc(name)+'</b> · '+rows.length+' extracted rows · '+issues+' needing attention · '+actionable+' proposed changes. <b>Nothing saved yet.</b></p>'+ 
+ out.innerHTML='<p><b>'+esc(name)+'</b> · '+rows.length+' unique lots from '+pending.rawCount+' extracted rows · '+issues+' needing attention · '+actionable+' proposed changes. <b>Nothing saved yet.</b></p>'+
+ (pending.missing.length?'<p class="pdf-note pdf-alert"><b>Missing expected lots:</b> '+pending.missing.join(', ')+'. Import is blocked until all 28 are identified.</p>':'')+
+ (pending.unexpected.length?'<p class="pdf-note pdf-alert"><b>Unexpected lot numbers:</b> '+pending.unexpected.map(esc).join(', ')+'. Import is blocked.</p>':'')+
+ (rows.some(r=>r.ocrConflict)?'<p class="pdf-note pdf-alert">Conflicting OCR readings were found for some lots. Those lots are blocked pending manual verification.</p>':'')+ 
  '<div class="cloud-row"><button type="button" id="lfPdfSelectAll">Select all changes</button><button type="button" id="lfPdfSelectNone">Clear selection</button></div>'+ 
  '<div class="pdf-table-wrap"><table><thead><tr><th>Apply</th><th>Stage</th><th>Lot</th><th>Current price</th><th>PDF price</th><th>Changes</th><th>Result</th></tr></thead><tbody>'+rows.map((r,i)=>{
  const ok=!r.blocked&&r.flag!=='No change';const desc=r.flag==='New lot'?'New lot: price, area, '+(r.sourceStatus?'status '+r.sourceStatus:'status confirmation required'):Object.keys(r.changes).map(k=>k+': '+(r.old?.[k]??'—')+' → '+r.changes[k]).join('; ')||'—';
