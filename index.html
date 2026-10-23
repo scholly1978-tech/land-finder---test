@@ -2615,6 +2615,10 @@ async function preview(){
 function recalculateDraft(){
  if(!pending)return;
  const {name,existing,stages}=pending;
+ // Keep the source draft in numeric lot order, so row buttons always target the right record.
+ // Never merge two different OCR rows silently: duplicates remain blocked for verification.
+ const lotOrder=(a,b)=>{const x=Number(a.lot),y=Number(b.lot);return (Number.isFinite(x)?x:Infinity)-(Number.isFinite(y)?y:Infinity)||String(a.lot).localeCompare(String(b.lot),undefined,{numeric:true})||String(a.stage||'').localeCompare(String(b.stage||''));};
+ pending.draft.sort(lotOrder);
  const uniqueParsed=pending.draft.map(r=>({...r,lot:String(r.lot||'').trim(),stage:String(r.stage||'').trim(),price:Number(r.price)}));
  const expectedGowrie=/^gowrie station$/i.test(name.trim());
  const counts=new Map();for(const r of uniqueParsed){const k=r.stage.toLowerCase()+'|'+r.lot.toLowerCase();counts.set(k,(counts.get(k)||0)+1);}
@@ -2650,8 +2654,9 @@ function editImportRow(i){
  const statusMap={'available':'Available','on hold':'On Hold','hold':'On Hold','sold':'Sold','off market':'Off Market'};
  const normalized=statusMap[status.trim().toLowerCase()];
  if(!/^\d{1,5}$/.test(lot.trim())||!pending.stages.some(s=>s.name.toLowerCase()===stage.trim().toLowerCase())||comparableMeasurement(area,'area')===null||!Number.isFinite(Number(price.replace(/[$,\s]/g,'')))||Number(price.replace(/[$,\s]/g,''))<=0||!normalized){alert('Invalid entry. Check lot number, existing stage, area, fixed price and status.');return;}
+ if(pending.draft.some((other,j)=>j!==i&&String(other.lot).trim()===String(Number(lot.trim()))&&String(other.stage).trim().toLowerCase()===stage.trim().toLowerCase())){alert('This lot already exists in the preview. Edit the existing row or remove the incorrect OCR row first. Nothing changed.');return;}
  if(!confirm('I have checked Lot '+lot.trim()+' against the ORIGINAL developer price list, including price, area and status. Apply this correction to the preview only?'))return;
- pending.draft[i]={...row,lot:lot.trim(),stage:stage.trim(),area:area.trim(),price:Number(price.replace(/[$,\s]/g,'')),sourceStatus:normalized,manuallyVerified:true};
+ pending.draft[i]={...row,lot:String(Number(lot.trim())),stage:stage.trim(),area:area.trim(),price:Number(price.replace(/[$,\s]/g,'')),sourceStatus:normalized,priceQualifier:'',ocrConflict:false,manuallyVerified:true};
  recalculateDraft();renderPending();
 }
 function addMissingImportRow(){
@@ -2664,25 +2669,34 @@ function addMissingImportRow(){
  const normalized={'available':'Available','on hold':'On Hold','hold':'On Hold','sold':'Sold','off market':'Off Market'}[status.trim().toLowerCase()];
  const num=Number(price.replace(/[$,\s]/g,''));
  if(!/^\d{1,5}$/.test(lot.trim())||!pending.stages.some(s=>s.name.toLowerCase()===stage.trim().toLowerCase())||comparableMeasurement(area,'area')===null||!Number.isFinite(num)||num<=0||!normalized){alert('Invalid entry. No changes made.');return;}
+ if(pending.draft.some(r=>String(r.lot).trim()===String(Number(lot.trim()))&&String(r.stage).trim().toLowerCase()===stage.trim().toLowerCase())){alert('Lot '+lot.trim()+' is already in this stage. Use Correct on its existing row instead. Nothing changed.');return;}
  if(!confirm('Confirm all details for Lot '+lot.trim()+' were checked against the ORIGINAL developer list. Add to preview only?'))return;
- pending.draft.push({lot:lot.trim(),stage:stage.trim(),area:area.trim(),price:num,sourceStatus:normalized,frontage:'',registration:'',priceQualifier:'',manuallyVerified:true});
+ pending.draft.push({lot:String(Number(lot.trim())),stage:stage.trim(),area:area.trim(),price:num,sourceStatus:normalized,frontage:'',registration:'',priceQualifier:'',manuallyVerified:true});
  recalculateDraft();renderPending();
+}
+function removeImportRow(i){
+ if(!pending||!pending.draft[i])return;
+ const row=pending.draft[i];
+ if(!confirm('Remove Stage '+row.stage+' Lot '+row.lot+' from this PREVIEW only?\n\nOnly remove an OCR error after checking the original developer list. No Supabase data will change.'))return;
+ pending.draft.splice(i,1);recalculateDraft();renderPending();
 }
 function renderPending(){
  const out=$('lfPdfResults');if(!pending||!out)return;
  const {name,rows}=pending,issues=rows.filter(r=>r.blocked).length,actionable=rows.filter(r=>!r.blocked&&r.flag!=='No change').length;
- out.innerHTML='<p><b>'+esc(name)+'</b> · '+rows.length+' unique lots from '+pending.rawCount+' extracted rows · '+issues+' needing attention · '+actionable+' proposed changes. <b>Nothing saved yet.</b></p>'+
+ const distinctLots=new Set(rows.map(r=>r.stage.trim().toLowerCase()+'|'+r.lot.trim().toLowerCase())).size;
+ out.innerHTML='<p><b>'+esc(name)+'</b> · '+distinctLots+' unique lots ('+rows.length+' preview rows) from '+pending.rawCount+' extracted rows · '+issues+' needing attention · '+actionable+' proposed changes. <b>Nothing saved yet.</b></p>'+
  (pending.missing.length?'<p class="pdf-note pdf-alert"><b>Missing expected lots:</b> '+pending.missing.join(', ')+'. Import is blocked until all 28 are identified.</p>':'')+
  (pending.unexpected.length?'<p class="pdf-note pdf-alert"><b>Unexpected lot numbers:</b> '+pending.unexpected.map(esc).join(', ')+'. Import is blocked.</p>':'')+
  (rows.some(r=>r.ocrConflict)?'<p class="pdf-note pdf-alert">Conflicting OCR readings were found for some lots. Those lots are blocked pending manual verification.</p>':'')+ 
  '<div class="cloud-row"><button type="button" id="lfPdfAddMissing">+ Add missing lot to preview</button><button type="button" id="lfPdfSelectAll">Select all changes</button><button type="button" id="lfPdfSelectNone">Clear selection</button></div>'+ 
  '<div class="pdf-table-wrap"><table><thead><tr><th>Apply</th><th>Stage</th><th>Lot</th><th>Current price</th><th>PDF price</th><th>Changes</th><th>Result</th><th>Correct</th></tr></thead><tbody>'+rows.map((r,i)=>{
  const ok=!r.blocked&&r.flag!=='No change';const desc=r.flag==='New lot'?'New lot: price, area, '+(r.sourceStatus?'status '+r.sourceStatus:'status confirmation required'):Object.keys(r.changes).map(k=>k+': '+(r.old?.[k]??'—')+' → '+r.changes[k]).join('; ')||'—';
- return '<tr><td><input type="checkbox" data-pdf-check="'+i+'" '+(ok?'checked':'disabled')+'></td><td>'+esc(r.stage)+'</td><td>'+esc(r.lot)+'</td><td>'+(r.old?.price==null?'—':'$'+Number(r.old.price).toLocaleString('en-AU'))+'</td><td>$'+r.price.toLocaleString('en-AU')+'</td><td>'+esc(desc)+'</td><td>'+esc(r.flag)+'</td></tr>';}).join('')+'</tbody></table></div>'+ 
+ return '<tr><td><input type="checkbox" data-pdf-check="'+i+'" '+(ok?'checked':'disabled')+'></td><td>'+esc(r.stage)+'</td><td>'+esc(r.lot)+'</td><td>'+(r.old?.price==null?'—':'$'+Number(r.old.price).toLocaleString('en-AU'))+'</td><td>$'+r.price.toLocaleString('en-AU')+'</td><td>'+esc(desc)+'</td><td>'+esc(r.flag)+'</td><td><button type="button" data-pdf-edit="'+i+'" aria-label="Correct lot '+esc(r.lot)+'">Edit</button> <button type="button" data-pdf-remove="'+i+'" aria-label="Remove incorrect OCR row for lot '+esc(r.lot)+'">Remove</button></td></tr>';}).join('')+'</tbody></table></div>'+ 
  '<p class="pdf-note pdf-alert">Check all extracted numbers carefully, especially images. Offers-over prices are blocked from automatic saving. Existing lot statuses never change from imports. New lot statuses require individual confirmation. Lots absent from the PDF are untouched. Blank PDF fields do not erase saved data. Approved changes update the shared LIVE database.</p>'+ 
  '<button type="button" id="lfPdfApprove" class="cloud-primary" '+(actionable?'':'disabled')+'>Review & approve selected changes</button><p id="lfPdfSaveMessage" role="status" class="pdf-note"></p>';
  $('lfPdfAddMissing').onclick=addMissingImportRow;
  out.querySelectorAll('[data-pdf-edit]').forEach(b=>b.onclick=()=>editImportRow(Number(b.dataset.pdfEdit)));
+ out.querySelectorAll('[data-pdf-remove]').forEach(b=>b.onclick=()=>removeImportRow(Number(b.dataset.pdfRemove)));
  $('lfPdfSelectAll').onclick=()=>out.querySelectorAll('[data-pdf-check]:not(:disabled)').forEach(c=>c.checked=true);
  $('lfPdfSelectNone').onclick=()=>out.querySelectorAll('[data-pdf-check]').forEach(c=>c.checked=false);
  $('lfPdfApprove').onclick=approve;
@@ -2692,6 +2706,7 @@ async function approve(){
  const selection=[...out.querySelectorAll('[data-pdf-check]:checked')].map(c=>pending.rows[Number(c.dataset.pdfCheck)]);
  if(!selection.length){msg.textContent='Select at least one changed lot.';return;}
  recalculateDraft();if(pending.rows.some(r=>r.blocked)){msg.textContent='Resolve all preview warnings before saving. Nothing saved.';return;}
+ if(new Set(pending.rows.map(r=>r.stageId+'|'+r.lot.toLowerCase())).size!==pending.rows.length){msg.textContent='Duplicate lot numbers detected. Nothing saved.';return;}
  if($('lfCloudLotFilter').value!==pending.estateId){clearPending();return;}
  const client=window.__lfLotImportClient;const user=await client.auth.getUser();if(!user.data?.user){msg.textContent='Sign in again before saving.';return;}
  // Re-read selected records to guard against changes since the preview.
