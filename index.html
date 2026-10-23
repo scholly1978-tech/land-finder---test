@@ -2529,8 +2529,15 @@ async function preview(){
   const existing=a.data||[],stages=b.data||[],duplicate=new Set();
   const rows=parsed.map(p=>{
    const key=p.stage.toLowerCase()+'|'+p.lot.toLowerCase(),isDup=duplicate.has(key);duplicate.add(key);
-   const stage=p.stage?stages.find(s=>s.name.trim().toLowerCase()===p.stage.toLowerCase()):(stages.length===1?stages[0]:null);
    const matches=existing.filter(l=>String(l.lot_number).trim().toLowerCase()===p.lot.toLowerCase());
+   // A stage-free developer list can match an EXISTING lot only when its number
+   // occurs exactly once in the selected estate. Never guess for duplicate lots.
+   // For new lots, a single configured estate stage is the only safe fallback.
+   const stage=p.stage
+    ? stages.find(s=>s.name.trim().toLowerCase()===p.stage.trim().toLowerCase())
+    : matches.length===1
+      ? stages.find(s=>s.id===matches[0].stage_id)
+      : matches.length===0&&stages.length===1 ? stages[0] : null;
    const old=stage?matches.find(l=>l.stage_id===stage.id):null;
    const conflict=matches.length>1||(matches.length===1&&!old);
    const changes={};
@@ -2541,7 +2548,7 @@ async function preview(){
    }
    const blocked=isDup||!stage||conflict||!!p.priceQualifier;
    const flag=isDup?'Duplicate in file':!stage?'Stage missing or ambiguous':conflict?'Lot number conflict':p.priceQualifier?'Offers over — manual review':!old?'New lot':Object.keys(changes).length?'Update':'No change';
-   return {...p,stageId:stage?.id,old,changes,flag,blocked};
+   return {...p,stage:stage?.name||p.stage,stageId:stage?.id,old,changes,flag,blocked};
   });
   pending={estateId,name,rows,fileName:file.name};
   renderPending();
