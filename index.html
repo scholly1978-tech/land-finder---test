@@ -2447,6 +2447,22 @@ function parse(rows){
  return result;
 }
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+// Compare measurement values rather than display units (e.g. 525 and 525sqm).
+// Preserve the original saved value when the measurement has not changed.
+function comparableMeasurement(value,unit){
+ const raw=String(value??'').trim().toLowerCase().replace(/,/g,'').replace(/\s+/g,'');
+ if(!raw)return null;
+ const suffix=unit==='area'?'(?:sqm|m²|m2)?':'(?:m|metres?|meters?)?';
+ const match=raw.match(new RegExp('^([+-]?[0-9]+(?:[.][0-9]+)?)'+suffix+'$','i'));
+ return match?Number(match[1]):null;
+}
+function measurementChanged(existing,incoming,unit){
+ const a=comparableMeasurement(existing,unit),b=comparableMeasurement(incoming,unit);
+ if(a!==null&&b!==null)return Math.abs(a-b)>0.000001;
+ return String(existing??'').trim().toLowerCase()!==String(incoming??'').trim().toLowerCase();
+}
+function normalizedRegistration(value){return String(value??'').trim().replace(/\s+/g,' ').toLowerCase();}
+
 async function preview(){
  const out=$('lfPdfResults'),file=$('lfPdfFile')?.files?.[0],estateId=$('lfCloudLotFilter')?.value;
  try{
@@ -2474,9 +2490,9 @@ async function preview(){
    const conflict=matches.length>1||(matches.length===1&&!old);
    const changes={};
    if(old){if(Number(old.price)!==p.price)changes.price=p.price;
-    if(p.frontage&&String(old.frontage||'').trim()!==p.frontage.trim())changes.frontage=p.frontage.trim();
-    if(p.area&&String(old.area||'').trim()!==p.area.trim())changes.area=p.area.trim();
-    if(p.registration&&String(old.title||'').trim()!==p.registration.trim())changes.title=p.registration.trim();
+    if(p.frontage&&measurementChanged(old.frontage,p.frontage,'frontage'))changes.frontage=p.frontage.trim();
+    if(p.area&&measurementChanged(old.area,p.area,'area'))changes.area=p.area.trim();
+    if(p.registration&&normalizedRegistration(old.title)!==normalizedRegistration(p.registration))changes.title=p.registration.trim();
    }
    const blocked=isDup||!stage||conflict;
    const flag=isDup?'Duplicate in PDF':!stage?'Stage not found':conflict?'Lot number conflict':!old?'New lot':Object.keys(changes).length?'Update':'No change';
