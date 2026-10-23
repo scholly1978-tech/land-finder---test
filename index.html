@@ -2396,7 +2396,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
 })();
 </script>
-<!-- TEST ONLY: PDF price-list importer with explicit review and approval. -->
+<!-- TEST ONLY: Price-list importer with add-new and update-existing preview. -->
 <style>
 #lfPdfImporter{border:1px solid #d4ded8;border-radius:12px;padding:15px;margin:15px 0;background:#f7faf8}#lfPdfImporter h3{margin:0 0 7px}#lfPdfImporter .pdf-note{font-size:12px;color:#4d5d53;margin:7px 0}#lfPdfImporter .pdf-table-wrap{overflow:auto;max-height:320px}#lfPdfImporter table{min-width:780px}#lfPdfImporter td,#lfPdfImporter th{padding:7px;font-size:12px}#lfPdfImporter .pdf-alert{color:#9b3226;font-weight:700}
 </style>
@@ -2414,6 +2414,23 @@ async function ocrImage(source,onProgress){
  const T=await ensureOcr();const worker=await T.createWorker("eng",1,{logger:m=>{if(m.status==="recognizing text"&&onProgress)onProgress(Math.round((m.progress||0)*100));}});
  try{const r=await worker.recognize(source);return r.data.text||"";}finally{await worker.terminate();}
 }
+// Gowrie Station-style columns: LOT | SIZE (m²) | PRICE ($) | STATUS.
+// Only accept complete rows; never infer missing prices or availability.
+function parseSimpleLotTable(text){
+ const found=[];let stage='';
+ for(const raw of text.split(/\r?\n/)){
+  const line=raw.replace(/[|]/g,' ').replace(/\s+/g,' ').trim();
+  const sm=line.match(/\bStage\s*(\d+[a-z]?)\b/i);
+  if(sm)stage='Stage '+sm[1];
+  const m=line.match(/^(?:Lot\s*)?(\d{1,3})\s+([\d,]{4,7})\s+\$?\s*([\d,]{5,9})(?:\.00)?\s+(AVAILABLE|ON\s+HOLD|HOLD|SOLD|OFF\s+MARKET)\b/i);
+  if(!m)continue;
+  const lot=Number(m[1]),area=Number(m[2].replace(/,/g,'')),price=Number(m[3].replace(/,/g,''));
+  if(lot<1||lot>999||area<100||area>100000||price<10000||price>100000000)continue;
+  const status=m[4].replace(/\s+/g,' ').toUpperCase();
+  found.push({stage,lot:String(lot),frontage:'',area:String(area)+'sqm',registration:'',price,priceQualifier:'',sourceStatus:status==='ON HOLD'?'On Hold':status==='OFF MARKET'?'Off Market':status[0]+status.slice(1).toLowerCase()});
+ }
+ return found;
+}
 function parseOcrText(text){
  let stage="",found=[];
  for(const raw of text.split(/\r?\n/)){
@@ -2424,7 +2441,7 @@ function parseOcrText(text){
   if(!m)continue;
   const price=Number(m[6].replace(/,/g,""));if(!price)continue;
   found.push({stage,lot:m[1],frontage:m[2]+"m",area:m[3]+"sqm",registration:m[4].trim(),price,priceQualifier:m[5]?"Offers over":""});
- }return found;
+ }return found.concat(parseSimpleLotTable(text));
 }
 
 let pending=null;
@@ -2439,7 +2456,7 @@ function ensurePdfJs(){
 function install(){
  const work=$('lfCloudLotWorkspace');if(!work||$('lfPdfImporter'))return;
  const el=document.createElement('section');el.id='lfPdfImporter';
- el.innerHTML='<h3>Import developer price list — PDF, JPEG or PNG</h3><div class="pdf-note">TEST: Review extracted details before saving. Images and scanned PDFs use text recognition and may contain errors. TEST and LIVE share Supabase. Offers-over prices require manual review.</div><div class="cloud-row"><label>Developer price list<input type="file" id="lfPdfFile" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png"></label><button id="lfPdfPreview" class="cloud-primary" type="button">Preview price list</button></div><div id="lfPdfResults" role="status" class="pdf-note">No file selected.</div>';
+ el.innerHTML='<h3>Import developer price list — PDF, JPEG or PNG</h3><div class="pdf-note">TEST: Can add missing lots and update existing lots after review. No data changes during preview. Images and scanned PDFs use text recognition and may contain errors. TEST and LIVE share Supabase. Offers-over prices require manual review.</div><div class="cloud-row"><label>Developer price list<input type="file" id="lfPdfFile" accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png"></label><button id="lfPdfPreview" class="cloud-primary" type="button">Preview price list</button></div><div id="lfPdfResults" role="status" class="pdf-note">No file selected.</div>';
  const editor=$('lfCloudLotEditor');work.insertBefore(el,editor||$('lfCloudLotTable'));
  $('lfPdfPreview').onclick=preview;
  $('lfPdfFile').onchange=clearPending; $('lfCloudLotFilter').addEventListener('change',clearPending);
@@ -2560,9 +2577,9 @@ function renderPending(){
  out.innerHTML='<p><b>'+esc(name)+'</b> · '+rows.length+' extracted rows · '+issues+' needing attention · '+actionable+' proposed changes. <b>Nothing saved yet.</b></p>'+ 
  '<div class="cloud-row"><button type="button" id="lfPdfSelectAll">Select all changes</button><button type="button" id="lfPdfSelectNone">Clear selection</button></div>'+ 
  '<div class="pdf-table-wrap"><table><thead><tr><th>Apply</th><th>Stage</th><th>Lot</th><th>Current price</th><th>PDF price</th><th>Changes</th><th>Result</th></tr></thead><tbody>'+rows.map((r,i)=>{
- const ok=!r.blocked&&r.flag!=='No change';const desc=r.flag==='New lot'?'New lot: price, frontage, area, registration':Object.keys(r.changes).map(k=>k+': '+(r.old?.[k]??'—')+' → '+r.changes[k]).join('; ')||'—';
+ const ok=!r.blocked&&r.flag!=='No change';const desc=r.flag==='New lot'?'New lot: price, area, '+(r.sourceStatus?'status '+r.sourceStatus:'status confirmation required'):Object.keys(r.changes).map(k=>k+': '+(r.old?.[k]??'—')+' → '+r.changes[k]).join('; ')||'—';
  return '<tr><td><input type="checkbox" data-pdf-check="'+i+'" '+(ok?'checked':'disabled')+'></td><td>'+esc(r.stage)+'</td><td>'+esc(r.lot)+'</td><td>'+(r.old?.price==null?'—':'$'+Number(r.old.price).toLocaleString('en-AU'))+'</td><td>$'+r.price.toLocaleString('en-AU')+'</td><td>'+esc(desc)+'</td><td>'+esc(r.flag)+'</td></tr>';}).join('')+'</tbody></table></div>'+ 
- '<p class="pdf-note pdf-alert">Check all extracted numbers carefully, especially images. Offers-over prices are blocked from automatic saving. Statuses never change from imports. Lots absent from the PDF are untouched. Blank PDF fields do not erase saved data. Approved changes update the shared LIVE database.</p>'+ 
+ '<p class="pdf-note pdf-alert">Check all extracted numbers carefully, especially images. Offers-over prices are blocked from automatic saving. Existing lot statuses never change from imports. New lot statuses require individual confirmation. Lots absent from the PDF are untouched. Blank PDF fields do not erase saved data. Approved changes update the shared LIVE database.</p>'+ 
  '<button type="button" id="lfPdfApprove" class="cloud-primary" '+(actionable?'':'disabled')+'>Review & approve selected changes</button><p id="lfPdfSaveMessage" role="status" class="pdf-note"></p>';
  $('lfPdfSelectAll').onclick=()=>out.querySelectorAll('[data-pdf-check]:not(:disabled)').forEach(c=>c.checked=true);
  $('lfPdfSelectNone').onclick=()=>out.querySelectorAll('[data-pdf-check]').forEach(c=>c.checked=false);
@@ -2582,13 +2599,13 @@ async function approve(){
   else if(same.length){msg.textContent='Lot '+r.lot+' now exists. Preview again before saving.';return;}
  }
  const nNew=selection.filter(r=>!r.old).length,nUpdate=selection.length-nNew;
- if(!confirm('SAVE TO SHARED SUPABASE DATABASE?\n\nEstate: '+pending.name+'\nUpdate existing lots: '+nUpdate+'\nAdd new lots: '+nNew+'\n\nThis will affect the LIVE kiosk too. No availability statuses will be changed.'))return;
+ if(!confirm('SAVE TO SHARED SUPABASE DATABASE?\n\nEstate: '+pending.name+'\nUpdate existing lots: '+nUpdate+'\nAdd new lots: '+nNew+'\n\nThis will affect the LIVE kiosk too. Existing lot statuses will not change. New lot statuses require confirmation.'))return;
  const btn=$('lfPdfApprove');btn.disabled=true;let updated=0,added=0,failed=[];
  for(const r of selection){
   try{
    const payload=r.old?r.changes:{estate_id:pending.estateId,stage_id:r.stageId,lot_number:r.lot,price:r.price,status:'Available',frontage:r.frontage||'',area:r.area||'',title:r.registration||''};
    // New lots have no explicit status in the PDF: require explicit confirmation rather than assuming Available.
-   if(!r.old){const status=prompt('The PDF does not state availability for new Lot '+r.lot+'. Enter Available, Hold, Sold, or Off Market to add it (Cancel skips):','');if(status===null){failed.push('Lot '+r.lot+': skipped (status not confirmed)');continue;}const normalized={'available':'Available','hold':'Hold','on hold':'On Hold','sold':'Sold','off market':'Off Market'}[status.trim().toLowerCase()];if(!normalized){failed.push('Lot '+r.lot+': invalid status, skipped');continue;}payload.status=normalized;}
+   if(!r.old){const status=prompt('Confirm status for new Lot '+r.lot+'. Check the developer list before approving. Enter Available, On Hold, Sold, or Off Market (Cancel skips):',r.sourceStatus||'');if(status===null){failed.push('Lot '+r.lot+': skipped (status not confirmed)');continue;}const normalized={'available':'Available','hold':'Hold','on hold':'On Hold','sold':'Sold','off market':'Off Market'}[status.trim().toLowerCase()];if(!normalized){failed.push('Lot '+r.lot+': invalid status, skipped');continue;}payload.status=normalized;}
    const query=r.old?client.from('lots').update(payload).eq('id',r.old.id):client.from('lots').insert(payload);
    const {data,error}=await query.select('id');if(error)throw error;if(!data?.length)throw Error('No row saved (check permissions)');
    if(r.old)updated++;else added++;
