@@ -2395,5 +2395,88 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
 })();
 </script>
+<!-- TEST ONLY: PDF price-list preview; never writes to Supabase. -->
+<style>
+#lfPdfImporter{border:1px solid #d4ded8;border-radius:12px;padding:15px;margin:15px 0;background:#f7faf8}#lfPdfImporter h3{margin:0 0 7px}#lfPdfImporter .pdf-note{font-size:12px;color:#4d5d53;margin:7px 0}#lfPdfImporter .pdf-table-wrap{overflow:auto;max-height:320px}#lfPdfImporter table{min-width:780px}#lfPdfImporter td,#lfPdfImporter th{padding:7px;font-size:12px}#lfPdfImporter .pdf-alert{color:#9b3226;font-weight:700}
+</style>
+<script>
+(function(){
+'use strict';
+const $=id=>document.getElementById(id);
+let pdfJsPromise;
+function ensurePdfJs(){
+ if(window.pdfjsLib)return Promise.resolve(window.pdfjsLib);
+ if(!pdfJsPromise)pdfJsPromise=new Promise((resolve,reject)=>{
+  const script=document.createElement('script');script.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+  script.onload=()=>{if(!window.pdfjsLib){reject(Error('PDF reader failed to load'));return;}window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';resolve(window.pdfjsLib)};
+  script.onerror=()=>reject(Error('PDF reader could not load. Check internet connection.'));document.head.appendChild(script);
+ });return pdfJsPromise;
+}
+function install(){
+ const work=$('lfCloudLotWorkspace');if(!work||$('lfPdfImporter'))return;
+ const el=document.createElement('section');el.id='lfPdfImporter';
+ el.innerHTML='<h3>Import developer PDF price list</h3><div class="pdf-note">TEST preview only — no lots will be changed in Supabase. Select the correct estate above, then choose a text-based PDF. This first version recognises tables like the Alford Grove price list.</div><div class="cloud-row"><label>PDF price list<input type="file" id="lfPdfFile" accept="application/pdf,.pdf"></label><button id="lfPdfPreview" class="cloud-primary" type="button">Preview PDF changes</button></div><div id="lfPdfResults" role="status" class="pdf-note">No PDF selected.</div>';
+ const editor=$('lfCloudLotEditor');work.insertBefore(el,editor||$('lfCloudLotTable'));
+ $('lfPdfPreview').onclick=preview;
+}
+function textRows(items){
+ const rows=[];
+ for(const item of items){const t=String(item.str||'').trim();if(!t)continue;const y=item.transform[5],x=item.transform[4];let r=rows.find(r=>Math.abs(r.y-y)<3);if(!r){r={y,words:[]};rows.push(r)}r.words.push({x,t});}
+ return rows.sort((a,b)=>b.y-a.y).map(r=>r.words.sort((a,b)=>a.x-b.x));
+}
+function parse(rows){
+ let stage='',result=[];
+ for(const words of rows){
+  const all=words.map(w=>w.t).join(' ').replace(/\s+/g,' ').trim();
+  const match=all.match(/\bStage\s*(\d+[A-Za-z]?)\b/i);
+  if(match){stage='Stage '+match[1];continue;}
+  if(/Lot\s*#/i.test(all)||!stage)continue;
+  const lot=words.find(w=>w.x<160&&/^\d{1,5}$/.test(w.t));
+  const price=words.find(w=>/\$\s*[\d,]+(?:\.\d{2})?/.test(w.t));
+  if(!lot||!price)continue;
+  const frontage=words.find(w=>w.x>=220&&w.x<325&&/^\d+(?:\.\d+)?\s*m$/i.test(w.t));
+  const area=words.find(w=>w.x>=325&&w.x<410&&/^\d+(?:\.\d+)?\s*(?:sqm|m²)$/i.test(w.t));
+  const registration=words.filter(w=>w.x>=410&&w.x<545).map(w=>w.t).join(' ');
+  const n=Number(price.t.replace(/[^\d.]/g,''));if(!Number.isFinite(n)||n<=0)continue;
+  result.push({stage,lot:lot.t,price:n,frontage:frontage?.t||'',area:area?.t||'',registration});
+ }
+ return result;
+}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function preview(){
+ const out=$('lfPdfResults'),file=$('lfPdfFile')?.files?.[0],estateId=$('lfCloudLotFilter')?.value;
+ try{
+  if(!file)throw Error('Choose a PDF file first.');if(file.size>15*1024*1024)throw Error('PDF exceeds 15 MB.');
+  if(estateId==='all')throw Error('Please select a specific estate in the Estate dropdown above.');
+  out.textContent='Reading PDF locally in your browser…';
+  const pdfjs=await ensurePdfJs(),data=new Uint8Array(await file.arrayBuffer()),doc=await pdfjs.getDocument({data}).promise;
+  let parsed=[];
+  for(let pageNo=1;pageNo<=Math.min(doc.numPages,15);pageNo++){
+   const page=await doc.getPage(pageNo),content=await page.getTextContent();parsed.push(...parse(textRows(content.items)));
+  }
+  if(!parsed.length)throw Error('No supported pricing rows detected. This PDF may be scanned or use another layout. Nothing was changed.');
+  const name=$('lfCloudLotFilter').selectedOptions[0]?.textContent||'';
+  const known=window.__lfPdfSnapshot;
+  // The cloud lot manager does not expose its private arrays. Read-only authenticated REST requests supply comparison data.
+  const client=window.supabase?.createClient('https://ajlbququbswnmzmbkiro.supabase.co','sb_publishable_BV5evD2xFxRCoVCbFrWwzw_eqTByI43',{auth:{persistSession:false,detectSessionInUrl:false}});
+  let existing=[],stages=[];
+  if(client){const [a,b]=await Promise.all([client.from('lots').select('lot_number,stage_id,price,frontage,area,title,status').eq('estate_id',estateId),client.from('stages').select('id,name').eq('estate_id',estateId)]);if(a.error||b.error)throw Error('Unable to compare with server inventory. Sign in and refresh Lot Management.');existing=a.data||[];stages=b.data||[];}
+  const duplicate=new Set(),rows=parsed.map(p=>{
+   const key=p.stage.toLowerCase()+'|'+p.lot.toLowerCase(),isDup=duplicate.has(key);duplicate.add(key);
+   const stage=stages.find(s=>s.name.trim().toLowerCase()===p.stage.toLowerCase());
+   const matches=existing.filter(l=>String(l.lot_number).trim().toLowerCase()===p.lot.toLowerCase());
+   const old=stage?matches.find(l=>l.stage_id===stage.id):null;
+   const flag=isDup?'Duplicate in PDF':!stage?'Stage not found':old?'Existing lot — review':'New lot — review';
+   return {...p,flag,old};
+  });
+  const issues=rows.filter(r=>r.flag==='Duplicate in PDF'||r.flag==='Stage not found').length;
+  out.innerHTML='<p><b>'+esc(name)+'</b> · '+rows.length+' PDF rows · '+issues+' needing attention. <b>Preview only: nothing has been saved.</b></p><div class="pdf-table-wrap"><table><thead><tr><th>Stage</th><th>Lot</th><th>PDF price</th><th>Current price</th><th>Frontage</th><th>Area</th><th>Registration</th><th>Result</th></tr></thead><tbody>'+rows.map(r=>'<tr><td>'+esc(r.stage)+'</td><td>'+esc(r.lot)+'</td><td>$'+r.price.toLocaleString('en-AU')+'</td><td>'+(r.old?.price==null?'—':'$'+Number(r.old.price).toLocaleString('en-AU'))+'</td><td>'+esc(r.frontage)+'</td><td>'+esc(r.area)+'</td><td>'+esc(r.registration)+'</td><td>'+esc(r.flag)+'</td></tr>').join('')+'</tbody></table></div><p class="pdf-note pdf-alert">Availability is NOT inferred from a listed price. Existing statuses and lots absent from the PDF remain untouched. Saving is disabled in this TEST preview.</p>';
+ }catch(e){out.textContent='PDF preview: '+e.message;}
+}
+const observer=new MutationObserver(()=>{if($('lfCloudLotWorkspace')&&!$('lfPdfImporter'))install()});
+function start(){observer.observe(document.body,{childList:true,subtree:true});install();}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
+})();
+</script>
 </body>
 </html>
